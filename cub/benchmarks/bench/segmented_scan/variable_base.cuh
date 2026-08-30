@@ -439,15 +439,19 @@ void multimodal_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> t
   const auto long_fraction     = state.get_float64("LongSegmentFraction{io}");
   const auto requested_ratio   = state.get_float64("LongToShortRatio{io}");
 
+  constexpr double minimum_short_segment_size = 16.0;
+  const auto minimum_mean_segment_size =
+    minimum_short_segment_size * ((1.0 - long_fraction) + long_fraction * requested_ratio);
+  if (static_cast<double>(mean_segment_size) < minimum_mean_segment_size)
+  {
+    state.skip("requested multimodal short segment size is below 16 elements");
+    return;
+  }
+
   const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
   const auto long_count        = rounded_multimodal_count(num_segments, long_fraction);
   const auto weight_ratio =
     compensated_multimodal_weight_ratio(elements, num_segments, long_count, requested_ratio);
-  if (weight_ratio == 0.0)
-  {
-    state.skip("requested multimodal ratio is infeasible for this mean segment size");
-    return;
-  }
 
   const auto weights = generate_multimodal_weights(num_segments, long_count, weight_ratio);
   variable_segmented_scan(state, tl, weights);
@@ -461,33 +465,38 @@ NVBENCH_BENCH_TYPES(even_segments, NVBENCH_TYPE_AXES(variable_value_types, varia
   .set_name("ragged_even")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis("MeanSegmentSize{io}", {16, 51, 123, 233, 513, 1337});
+  .add_int64_axis(
+    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384});
 
 NVBENCH_BENCH_TYPES(lognormal_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
   .set_name("ragged_lognormal")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis("MeanSegmentSize{io}", {16, 51, 123, 233, 513, 1337})
+  .add_int64_axis(
+    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
   .add_float64_axis("Sigma{io}", {0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5});
 
 NVBENCH_BENCH_TYPES(pareto_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
   .set_name("ragged_pareto")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis("MeanSegmentSize{io}", {16, 51, 123, 233, 513, 1337})
+  .add_int64_axis(
+    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
   .add_float64_axis("Alpha{io}", {5.0, 4.0, 3.0, 2.5, 2.0, 1.75, 1.5});
 
 NVBENCH_BENCH_TYPES(zipf_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
   .set_name("ragged_zipf")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis("MeanSegmentSize{io}", {16, 51, 123, 233, 513, 1337})
+  .add_int64_axis(
+    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
   .add_float64_axis("Exponent{io}", {0.75, 1.0, 1.25, 1.5, 1.6, 2.0});
 
 NVBENCH_BENCH_TYPES(multimodal_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
   .set_name("ragged_multimodal")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis("MeanSegmentSize{io}", {16, 51, 123, 233, 513, 1337})
+  .add_int64_axis(
+    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
   .add_float64_axis("LongSegmentFraction{io}", {0.25, 0.10, 0.02})
-  .add_float64_axis("LongToShortRatio{io}", {10.0, 50.0, 500.0});
+  .add_float64_axis("LongToShortRatio{io}", {10.0, 50.0, 100.0, 250.0, 500.0});

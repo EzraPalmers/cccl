@@ -9,6 +9,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/fill.h>
 #include <thrust/for_each.h>
+#include <thrust/gather.h>
 #include <thrust/host_vector.h>
 #include <thrust/logical.h>
 #include <thrust/memory.h>
@@ -29,11 +30,35 @@
 #include <cuda/std/limits>
 
 #include <cstddef>
+#include <string>
 
 #include <nvbench_helper.cuh>
 
 namespace
 {
+struct default_variable_benchmark_traits
+{
+  using value_types = nvbench::type_list<int32_t, int64_t, float, double>;
+
+  template <typename T, typename OffsetT>
+  [[nodiscard]] static thrust::device_vector<T> make_input(OffsetT elements)
+  {
+    return generate(elements);
+  }
+
+  template <typename T, typename OffsetT>
+  static void validate(const thrust::device_vector<T>&,
+                       const thrust::device_vector<T>&,
+                       const thrust::device_vector<OffsetT>&) noexcept
+  {}
+};
+
+#ifdef VARIABLE_BENCHMARK_TRAITS
+using variable_benchmark_traits = VARIABLE_BENCHMARK_TRAITS;
+#else
+using variable_benchmark_traits = default_variable_benchmark_traits;
+#endif
+
 inline constexpr cuda::std::uint64_t seed = 0xCCC1;
 
 [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr cuda::std::uint64_t
@@ -51,14 +76,6 @@ counter_uniform(cuda::std::uint64_t index, cuda::std::uint64_t stream = 0) noexc
 {
   return static_cast<double>((counter_u64(index, stream) >> 11) + 0.5) / 9007199254740992.0;
 }
-
-struct even_weight
-{
-  [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr double operator()(cuda::std::uint64_t) const noexcept
-  {
-    return 1.0;
-  }
-};
 
 struct lognormal_weight
 {
@@ -119,6 +136,15 @@ struct multimodal_hash
   operator()(cuda::std::uint64_t index) const noexcept
   {
     return counter_u64(index, 4);
+  }
+};
+
+struct shuffled_hash
+{
+  [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr cuda::std::uint64_t
+  operator()(cuda::std::uint64_t index) const noexcept
+  {
+    return counter_u64(index, 5);
   }
 };
 
@@ -236,9 +262,161 @@ generate_multimodal_weights(OffsetT num_segments, OffsetT long_count, double wei
 }
 
 template <typename OffsetT>
+[[nodiscard]] bool apply_segment_ordering(
+  nvbench::state& state,
+  thrust::device_vector<OffsetT>& lengths,
+  const std::string& ordering,
+  const OffsetT long_count)
+{
+  if (ordering == "as_sampled")
+  {
+    return true;
+  }
+  if (ordering == "ascending")
+  {
+    thrust::stable_sort(lengths.begin(), lengths.end());
+    return true;
+  }
+  if (ordering == "descending")
+  {
+    thrust::stable_sort(lengths.begin(), lengths.end(), ::cuda::std::greater<OffsetT>{});
+    return true;
+  }
+  if (ordering == "shuffled")
+  {
+    auto hashes = thrust::device_vector<cuda::std::uint64_t>(lengths.size(), thrust::no_init);
+    thrust::tabulate(hashes.begin(), hashes.end(), shuffled_hash{});
+    thrust::stable_sort_by_key(hashes.begin(), hashes.end(), lengths.begin());
+    return true;
+  }
+  if (ordering == "clustered")
+  {
+    auto sorted_lengths = lengths;
+    thrust::stable_sort(sorted_lengths.begin(), sorted_lengths.end(), ::cuda::std::greater<OffsetT>{});
+
+    auto hashes = thrust::device_vector<cuda::std::uint64_t>(lengths.size(), thrust::no_init);
+    thrust::tabulate(hashes.begin(), hashes.end(), shuffled_hash{});
+    thrust::stable_sort_by_key(hashes.begin(), hashes.begin() + long_count, sorted_lengths.begin());
+    thrust::stable_sort_by_key(
+      hashes.begin() + long_count, hashes.end(), sorted_lengths.begin() + long_count);
+
+    const auto num_segments   = static_cast<OffsetT>(lengths.size());
+    const auto rest_count     = num_segments - long_count;
+    const auto cluster_count  = cuda::std::max(OffsetT{1}, cuda::ceil_div(long_count, OffsetT{100}));
+    const auto long_base      = long_count / cluster_count;
+    const auto long_remainder = long_count % cluster_count;
+    const auto rest_base       = rest_count / cluster_count;
+    const auto rest_remainder  = rest_count % cluster_count;
+
+    thrust::host_vector<OffsetT> host_indices;
+    host_indices.reserve(lengths.size());
+    OffsetT long_index = 0;
+    OffsetT rest_index = long_count;
+    for (OffsetT cluster = 0; cluster < cluster_count; ++cluster)
+    {
+      const auto long_run = long_base + static_cast<OffsetT>(cluster < long_remainder);
+      for (OffsetT index = 0; index < long_run; ++index)
+      {
+        host_indices.push_back(long_index++);
+      }
+
+      const auto gap = rest_base + static_cast<OffsetT>(cluster < rest_remainder);
+      for (OffsetT index = 0; index < gap; ++index)
+      {
+        host_indices.push_back(rest_index++);
+      }
+    }
+
+    const thrust::device_vector<OffsetT> indices = host_indices;
+    auto ordered_lengths = thrust::device_vector<OffsetT>(lengths.size(), thrust::no_init);
+    thrust::gather(indices.begin(), indices.end(), sorted_lengths.begin(), ordered_lengths.begin());
+    lengths.swap(ordered_lengths);
+    return true;
+  }
+
+  state.skip("unknown segment ordering");
+  return false;
+}
+
+template <typename OffsetT>
+void add_realised_shape_summaries(nvbench::state& state, const thrust::device_vector<OffsetT>& lengths)
+{
+  const thrust::host_vector<OffsetT> host_lengths = lengths;
+  cuda::std::int64_t total_length = 0;
+  OffsetT max_segment_length      = 0;
+  for (const auto segment_length : host_lengths)
+  {
+    total_length += segment_length;
+    max_segment_length = ::cuda::std::max(max_segment_length, segment_length);
+  }
+
+  const auto mean = static_cast<double>(total_length) / static_cast<double>(host_lengths.size());
+  double squared_deviation_sum = 0.0;
+  for (const auto segment_length : host_lengths)
+  {
+    const auto deviation = static_cast<double>(segment_length) - mean;
+    squared_deviation_sum += deviation * deviation;
+  }
+
+  const auto coefficient_of_variation =
+    cuda::std::sqrt(squared_deviation_sum / static_cast<double>(host_lengths.size())) / mean;
+
+  auto& cv_summary = state.add_summary("user/derived/realised_segment_length_cv");
+  cv_summary.set_string("name", "RealisedSegmentLengthCV");
+  cv_summary.set_float64("value", coefficient_of_variation);
+
+  auto& max_summary = state.add_summary("user/derived/realised_max_segment_length");
+  max_summary.set_string("name", "RealisedMaxSegmentLength");
+  max_summary.set_int64("value", max_segment_length);
+}
+
+template <typename OffsetT>
+void add_realised_ordering_summary(nvbench::state& state, const thrust::device_vector<OffsetT>& lengths)
+{
+  const thrust::host_vector<OffsetT> host_lengths = lengths;
+  double correlation = 0.0;
+  if (host_lengths.size() >= 2)
+  {
+    cuda::std::int64_t total_length = 0;
+    for (const auto segment_length : host_lengths)
+    {
+      total_length += segment_length;
+    }
+    const auto mean = static_cast<double>(total_length) / static_cast<double>(host_lengths.size());
+
+    double adjacent_product_sum       = 0.0;
+    double leading_squared_sum        = 0.0;
+    double trailing_squared_sum       = 0.0;
+    for (std::size_t index = 0; index + 1 < host_lengths.size(); ++index)
+    {
+      const auto leading_deviation  = static_cast<double>(host_lengths[index]) - mean;
+      const auto trailing_deviation = static_cast<double>(host_lengths[index + 1]) - mean;
+      adjacent_product_sum += leading_deviation * trailing_deviation;
+      leading_squared_sum += leading_deviation * leading_deviation;
+      trailing_squared_sum += trailing_deviation * trailing_deviation;
+    }
+
+    const auto denominator = cuda::std::sqrt(leading_squared_sum * trailing_squared_sum);
+    if (denominator != 0.0)
+    {
+      correlation = adjacent_product_sum / denominator;
+    }
+  }
+
+  auto& summary = state.add_summary("user/derived/realised_segment_length_lag1_correlation");
+  summary.set_string("name", "RealisedSegmentLengthLag1Correlation");
+  summary.set_float64("value", correlation);
+}
+
+template <typename OffsetT>
 [[nodiscard]] thrust::device_vector<OffsetT>
 weights_to_offsets(
-  nvbench::state& state, OffsetT elements, OffsetT num_segments, const thrust::device_vector<double>& weights)
+  nvbench::state& state,
+  OffsetT elements,
+  OffsetT num_segments,
+  const thrust::device_vector<double>& weights,
+  const std::string& ordering,
+  const OffsetT long_count)
 {
   if (weights.size() != static_cast<std::size_t>(num_segments)
       || !thrust::all_of(weights.begin(), weights.end(), valid_weight{}))
@@ -286,9 +464,21 @@ weights_to_offsets(
     return {};
   }
 
+  add_realised_shape_summaries(state, lengths);
+  if (!apply_segment_ordering(state, lengths, ordering, long_count))
+  {
+    return {};
+  }
+  add_realised_ordering_summary(state, lengths);
+
   auto offsets = thrust::device_vector<OffsetT>(num_segments + 1, thrust::no_init);
   thrust::fill_n(offsets.begin(), 1, OffsetT{0});
   thrust::inclusive_scan(lengths.begin(), lengths.end(), offsets.begin() + 1);
+  if (static_cast<OffsetT>(offsets.back()) != elements)
+  {
+    state.skip("ordered segment offsets do not cover all elements");
+    return {};
+  }
   return offsets;
 }
 
@@ -311,56 +501,29 @@ template <typename OffsetT>
   return numerator / denominator;
 }
 
-template <typename OffsetT>
-void add_realised_shape_summaries(
-  nvbench::state& state, const thrust::device_vector<OffsetT>& offsets, OffsetT num_segments)
-{
-  const thrust::host_vector<OffsetT> host_offsets = offsets;
-  const auto mean = static_cast<double>(host_offsets.back()) / static_cast<double>(num_segments);
-  double squared_deviation_sum = 0.0;
-  OffsetT max_segment_length   = 0;
-
-  for (OffsetT segment = 0; segment < num_segments; ++segment)
-  {
-    const auto segment_length = host_offsets[segment + 1] - host_offsets[segment];
-    const auto deviation      = static_cast<double>(segment_length) - mean;
-    squared_deviation_sum += deviation * deviation;
-    max_segment_length = ::cuda::std::max(max_segment_length, segment_length);
-  }
-
-  const auto coefficient_of_variation =
-    cuda::std::sqrt(squared_deviation_sum / static_cast<double>(num_segments)) / mean;
-
-  auto& cv_summary = state.add_summary("user/derived/realised_segment_length_cv");
-  cv_summary.set_string("name", "RealisedSegmentLengthCV");
-  cv_summary.set_float64("value", coefficient_of_variation);
-
-  auto& max_summary = state.add_summary("user/derived/realised_max_segment_length");
-  max_summary.set_string("name", "RealisedMaxSegmentLength");
-  max_summary.set_int64("value", max_segment_length);
-}
-
 template <typename T, typename OffsetT>
 void variable_segmented_scan(
-  nvbench::state& state, nvbench::type_list<T, OffsetT>, const thrust::device_vector<double>& weights)
+  nvbench::state& state,
+  nvbench::type_list<T, OffsetT>,
+  const thrust::device_vector<double>& weights,
+  const OffsetT long_count)
 {
   const auto elements          = static_cast<OffsetT>(state.get_int64("Elements{io}"));
   const auto mean_segment_size = static_cast<OffsetT>(state.get_int64("MeanSegmentSize{io}"));
+  const auto ordering          = state.get_string("SegmentOrdering{io}");
   const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
 
   auto& summary = state.add_summary("user/derived/segment_count");
   summary.set_string("name", "#Segments");
   summary.set_int64("value", num_segments);
 
-  const thrust::device_vector<T> input = generate(elements);
+  const thrust::device_vector<T> input = variable_benchmark_traits::make_input<T>(elements);
   thrust::device_vector<T> output(elements, thrust::default_init);
-  const auto offsets = weights_to_offsets(state, elements, num_segments, weights);
+  const auto offsets = weights_to_offsets(state, elements, num_segments, weights, ordering, long_count);
   if (offsets.empty())
   {
     return;
   }
-  add_realised_shape_summaries(state, offsets, num_segments);
-
   const T* d_input         = thrust::raw_pointer_cast(input.data());
   T* d_output              = thrust::raw_pointer_cast(output.data());
   const OffsetT* d_offsets = thrust::raw_pointer_cast(offsets.data());
@@ -386,16 +549,7 @@ void variable_segmented_scan(
       T{},
       env);
   });
-}
-
-template <typename T, typename OffsetT>
-void even_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
-{
-  const auto elements          = static_cast<OffsetT>(state.get_int64("Elements{io}"));
-  const auto mean_segment_size = static_cast<OffsetT>(state.get_int64("MeanSegmentSize{io}"));
-  const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
-  const auto weights           = generate_weights(num_segments, even_weight{});
-  variable_segmented_scan(state, tl, weights);
+  variable_benchmark_traits::validate(input, output, offsets);
 }
 
 template <typename T, typename OffsetT>
@@ -406,7 +560,7 @@ void lognormal_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl
   const auto sigma             = state.get_float64("Sigma{io}");
   const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
   const auto weights           = generate_weights(num_segments, lognormal_weight{sigma});
-  variable_segmented_scan(state, tl, weights);
+  variable_segmented_scan(state, tl, weights, cuda::ceil_div(num_segments, OffsetT{4}));
 }
 
 template <typename T, typename OffsetT>
@@ -417,7 +571,7 @@ void pareto_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
   const auto alpha             = state.get_float64("Alpha{io}");
   const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
   const auto weights           = generate_weights(num_segments, pareto_weight{alpha});
-  variable_segmented_scan(state, tl, weights);
+  variable_segmented_scan(state, tl, weights, cuda::ceil_div(num_segments, OffsetT{4}));
 }
 
 template <typename T, typename OffsetT>
@@ -428,7 +582,7 @@ void zipf_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
   const auto exponent          = state.get_float64("Exponent{io}");
   const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
   const auto weights           = generate_zipf_weights(num_segments, exponent);
-  variable_segmented_scan(state, tl, weights);
+  variable_segmented_scan(state, tl, weights, cuda::ceil_div(num_segments, OffsetT{4}));
 }
 
 template <typename T, typename OffsetT>
@@ -454,19 +608,12 @@ void multimodal_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> t
     compensated_multimodal_weight_ratio(elements, num_segments, long_count, requested_ratio);
 
   const auto weights = generate_multimodal_weights(num_segments, long_count, weight_ratio);
-  variable_segmented_scan(state, tl, weights);
+  variable_segmented_scan(state, tl, weights, long_count);
 }
 } // namespace
 
-using variable_value_types = nvbench::type_list<int32_t, int64_t, float, double>;
+using variable_value_types  = variable_benchmark_traits::value_types;
 using variable_offset_types = nvbench::type_list<int32_t>;
-
-NVBENCH_BENCH_TYPES(even_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
-  .set_name("ragged_even")
-  .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis(
-    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384});
 
 NVBENCH_BENCH_TYPES(lognormal_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
   .set_name("ragged_lognormal")
@@ -474,6 +621,7 @@ NVBENCH_BENCH_TYPES(lognormal_segments, NVBENCH_TYPE_AXES(variable_value_types, 
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
   .add_int64_axis(
     "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "shuffled", "clustered"})
   .add_float64_axis("Sigma{io}", {0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5});
 
 NVBENCH_BENCH_TYPES(pareto_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
@@ -482,6 +630,7 @@ NVBENCH_BENCH_TYPES(pareto_segments, NVBENCH_TYPE_AXES(variable_value_types, var
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
   .add_int64_axis(
     "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "shuffled", "clustered"})
   .add_float64_axis("Alpha{io}", {5.0, 4.0, 3.0, 2.5, 2.0, 1.75, 1.5});
 
 NVBENCH_BENCH_TYPES(zipf_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
@@ -490,6 +639,7 @@ NVBENCH_BENCH_TYPES(zipf_segments, NVBENCH_TYPE_AXES(variable_value_types, varia
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
   .add_int64_axis(
     "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "shuffled", "clustered"})
   .add_float64_axis("Exponent{io}", {0.75, 1.0, 1.25, 1.5, 1.6, 2.0});
 
 NVBENCH_BENCH_TYPES(multimodal_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
@@ -498,5 +648,6 @@ NVBENCH_BENCH_TYPES(multimodal_segments, NVBENCH_TYPE_AXES(variable_value_types,
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
   .add_int64_axis(
     "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "shuffled", "clustered"})
   .add_float64_axis("LongSegmentFraction{io}", {0.25, 0.10, 0.02})
-  .add_float64_axis("LongToShortRatio{io}", {10.0, 50.0, 100.0, 250.0, 500.0});
+  .add_float64_axis("LongToShortRatio{io}", {10.0, 50.0, 100.0});

@@ -27,7 +27,7 @@
 #    define TUNE_LOAD_MODIFIER cub::LOAD_CA
 #  endif // TUNE_LOAD
 
-template <int ThreadsPerBlock, int ItemsPerThread, int MaxSegmentsPerBlock>
+template <int ThreadsPerBlock, int ItemsPerThread>
 struct policy_selector_t
 {
   [[nodiscard]] _CCCL_HOST_DEVICE constexpr auto operator()(cuda::compute_capability) const -> cub::SegmentedScanPolicy
@@ -39,7 +39,7 @@ struct policy_selector_t
       TUNE_LOAD_MODIFIER,
       TUNE_BLOCK_STORE_ALGORITHM,
       cub::BLOCK_SCAN_WARP_SCANS,
-      MaxSegmentsPerBlock}};
+      512}};
   }
 };
 #endif // TUNE_BASE
@@ -64,7 +64,7 @@ template <size_t Wobble = 0, typename T, typename OffsetT>
 static void bench_impl(nvbench::state& state, nvbench::type_list<T, OffsetT>)
 {
 #if !TUNE_BASE
-  using policy_t = policy_selector_t<TUNE_THREADS, TUNE_ITEMS, TUNE_MAX_SEGMENTS_PER_BLOCK>;
+  using policy_t = policy_selector_t<TUNE_THREADS, TUNE_ITEMS>;
 #endif
 
   const auto elements     = static_cast<OffsetT>(state.get_int64("Elements{io}"));
@@ -149,5 +149,4 @@ NVBENCH_BENCH_TYPES(varying_segment_size_bench, NVBENCH_TYPE_AXES(benched_value_
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
   .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
   .add_int64_axis("SegmentSize{io}", {51, 123, 233, 513, 1337, 4417});
-// .add_int64_axis("SegmentsPerWorker{io}", {1}) // public API doesn' expose them (yet)
 // .add_string_axis("Worker{io}", {"block"});

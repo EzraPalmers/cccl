@@ -107,6 +107,8 @@ struct make_matrix
 struct matrix_benchmark_traits
 {
   using value_types = nvbench::type_list<matrix4x4>;
+  using ordering_value_types = value_types;
+  inline static const std::vector<nvbench::int64_t> element_count_powers{22, 24};
 
   template <typename T, typename OffsetT>
   [[nodiscard]] static thrust::device_vector<T> make_input(OffsetT elements)

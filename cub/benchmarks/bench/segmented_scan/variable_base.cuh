@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include <nvbench_helper.cuh>
 
@@ -39,6 +40,8 @@ namespace
 struct default_variable_benchmark_traits
 {
   using value_types = nvbench::type_list<int32_t, int64_t, float, double>;
+  using ordering_value_types = nvbench::type_list<int32_t, double>;
+  inline static const std::vector<nvbench::int64_t> element_count_powers{22, 26};
 
   template <typename T, typename OffsetT>
   [[nodiscard]] static thrust::device_vector<T> make_input(OffsetT elements)
@@ -567,6 +570,12 @@ void lognormal_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl
 }
 
 template <typename T, typename OffsetT>
+void lognormal_ordering_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
+{
+  lognormal_segments(state, tl);
+}
+
+template <typename T, typename OffsetT>
 void pareto_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
 {
   const auto elements          = static_cast<OffsetT>(state.get_int64("Elements{io}"));
@@ -578,6 +587,12 @@ void pareto_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
 }
 
 template <typename T, typename OffsetT>
+void pareto_ordering_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
+{
+  pareto_segments(state, tl);
+}
+
+template <typename T, typename OffsetT>
 void zipf_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
 {
   const auto elements          = static_cast<OffsetT>(state.get_int64("Elements{io}"));
@@ -586,6 +601,12 @@ void zipf_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
   const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
   const auto weights           = generate_zipf_weights(seed_t{}, num_segments, exponent);
   variable_segmented_scan(state, tl, weights, cuda::ceil_div(num_segments, OffsetT{4}));
+}
+
+template <typename T, typename OffsetT>
+void zipf_ordering_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
+{
+  zipf_segments(state, tl);
 }
 
 template <typename T, typename OffsetT>
@@ -613,17 +634,71 @@ void multimodal_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> t
   const auto weights = generate_multimodal_weights(num_segments, long_count, weight_ratio);
   variable_segmented_scan(state, tl, weights, long_count);
 }
+
+template <typename T, typename OffsetT>
+void multimodal_ordering_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
+{
+  const auto elements          = static_cast<OffsetT>(state.get_int64("Elements{io}"));
+  const auto mean_segment_size = static_cast<OffsetT>(state.get_int64("MeanSegmentSize{io}"));
+  const auto shape             = state.get_string("MultimodalShape{io}");
+
+  double long_fraction   = 0.0;
+  double requested_ratio = 0.0;
+  if (shape == "0.02:2")
+  {
+    long_fraction   = 0.02;
+    requested_ratio = 2.0;
+  }
+  else if (shape == "0.05:16")
+  {
+    long_fraction   = 0.05;
+    requested_ratio = 16.0;
+  }
+  else if (shape == "0.10:64")
+  {
+    long_fraction   = 0.10;
+    requested_ratio = 64.0;
+  }
+  else if (shape == "0.20:200")
+  {
+    long_fraction   = 0.20;
+    requested_ratio = 200.0;
+  }
+  else
+  {
+    state.skip("unknown multimodal shape");
+    return;
+  }
+
+  constexpr double minimum_short_segment_size = 16.0;
+  const auto minimum_mean_segment_size =
+    minimum_short_segment_size * ((1.0 - long_fraction) + long_fraction * requested_ratio);
+  if (static_cast<double>(mean_segment_size) < minimum_mean_segment_size)
+  {
+    state.skip("requested multimodal short segment size is below 16 elements");
+    return;
+  }
+
+  const auto num_segments = cuda::ceil_div(elements, mean_segment_size);
+  const auto long_count = rounded_multimodal_count(num_segments, long_fraction);
+  const auto weight_ratio =
+    compensated_multimodal_weight_ratio(elements, num_segments, long_count, requested_ratio);
+
+  const auto weights = generate_multimodal_weights(num_segments, long_count, weight_ratio);
+  variable_segmented_scan(state, tl, weights, long_count);
+}
 } // namespace
 
 using variable_value_types  = variable_benchmark_traits::value_types;
 using variable_offset_types = nvbench::type_list<int32_t>;
+using ordering_value_types  = variable_benchmark_traits::ordering_value_types;
 
 // The range runs from uniform through increasingly concentrated segment-length distributions and stops before a
 // single segment owns most of the array, at which point the kernel has nothing left to balance.
 NVBENCH_BENCH_TYPES(lognormal_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
-  .set_name("ragged_lognormal")
+  .set_name("lognormal")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", {22, 26})
+  .add_int64_power_of_two_axis("Elements{io}", variable_benchmark_traits::element_count_powers)
   .add_int64_axis("MeanSegmentSize{io}", {32, 64, 128, 256, 512, 1024, 2048})
   .add_string_axis("SegmentOrdering{io}", {"as_sampled"})
   .add_float64_axis(
@@ -634,9 +709,9 @@ NVBENCH_BENCH_TYPES(lognormal_segments, NVBENCH_TYPE_AXES(variable_value_types, 
      2.1, 2.2, 2.3, 2.4, 2.5});
 
 NVBENCH_BENCH_TYPES(pareto_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
-  .set_name("ragged_pareto")
+  .set_name("pareto")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", {22, 26})
+  .add_int64_power_of_two_axis("Elements{io}", variable_benchmark_traits::element_count_powers)
   .add_int64_axis("MeanSegmentSize{io}", {32, 64, 128, 256, 512, 1024, 2048})
   .add_string_axis("SegmentOrdering{io}", {"as_sampled"})
   .add_float64_axis(
@@ -648,9 +723,9 @@ NVBENCH_BENCH_TYPES(pareto_segments, NVBENCH_TYPE_AXES(variable_value_types, var
      3.2, 3.4, 3.6, 3.8, 4.0, 4.2, 4.4, 4.6, 4.8, 5.0});
 
 NVBENCH_BENCH_TYPES(zipf_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
-  .set_name("ragged_zipf")
+  .set_name("zipf")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", {22, 26})
+  .add_int64_power_of_two_axis("Elements{io}", variable_benchmark_traits::element_count_powers)
   .add_int64_axis("MeanSegmentSize{io}", {32, 64, 128, 256, 512, 1024, 2048})
   .add_string_axis("SegmentOrdering{io}", {"as_sampled"})
   .add_float64_axis(
@@ -661,10 +736,42 @@ NVBENCH_BENCH_TYPES(zipf_segments, NVBENCH_TYPE_AXES(variable_value_types, varia
      2.2, 2.5, 3.0});
 
 NVBENCH_BENCH_TYPES(multimodal_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
-  .set_name("ragged_multimodal")
+  .set_name("multimodal")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", {22, 26})
+  .add_int64_power_of_two_axis("Elements{io}", variable_benchmark_traits::element_count_powers)
   .add_int64_axis("MeanSegmentSize{io}", {32, 64, 128, 256, 512, 1024, 2048})
   .add_string_axis("SegmentOrdering{io}", {"as_sampled"})
   .add_float64_axis("LongSegmentFraction{io}", {0.02, 0.05, 0.10, 0.20})
   .add_float64_axis("LongToShortRatio{io}", {2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 100.0, 200.0});
+
+NVBENCH_BENCH_TYPES(lognormal_ordering_segments, NVBENCH_TYPE_AXES(ordering_value_types, variable_offset_types))
+  .set_name("lognormal_ordering")
+  .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
+  .add_int64_power_of_two_axis("Elements{io}", variable_benchmark_traits::element_count_powers)
+  .add_int64_axis("MeanSegmentSize{io}", {64, 256, 1024, 2048})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "clustered"})
+  .add_float64_axis("Sigma{io}", {0.0, 0.35, 0.7, 1.05, 1.4, 1.75, 2.1, 2.5});
+
+NVBENCH_BENCH_TYPES(pareto_ordering_segments, NVBENCH_TYPE_AXES(ordering_value_types, variable_offset_types))
+  .set_name("pareto_ordering")
+  .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
+  .add_int64_power_of_two_axis("Elements{io}", variable_benchmark_traits::element_count_powers)
+  .add_int64_axis("MeanSegmentSize{io}", {64, 256, 1024, 2048})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "clustered"})
+  .add_float64_axis("Alpha{io}", {1.3, 1.8, 2.3, 2.8, 3.3, 3.8, 4.3, 5.0});
+
+NVBENCH_BENCH_TYPES(zipf_ordering_segments, NVBENCH_TYPE_AXES(ordering_value_types, variable_offset_types))
+  .set_name("zipf_ordering")
+  .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
+  .add_int64_power_of_two_axis("Elements{io}", variable_benchmark_traits::element_count_powers)
+  .add_int64_axis("MeanSegmentSize{io}", {64, 256, 1024, 2048})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "clustered"})
+  .add_float64_axis("Exponent{io}", {0.0, 0.4, 0.8, 1.2, 1.6, 2.0, 2.5, 3.0});
+
+NVBENCH_BENCH_TYPES(multimodal_ordering_segments, NVBENCH_TYPE_AXES(ordering_value_types, variable_offset_types))
+  .set_name("multimodal_ordering")
+  .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
+  .add_int64_power_of_two_axis("Elements{io}", variable_benchmark_traits::element_count_powers)
+  .add_int64_axis("MeanSegmentSize{io}", {64, 256, 1024, 2048})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "clustered"})
+  .add_string_axis("MultimodalShape{io}", {"0.02:2", "0.05:16", "0.10:64", "0.20:200"});

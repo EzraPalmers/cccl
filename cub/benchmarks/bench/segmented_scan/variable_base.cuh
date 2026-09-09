@@ -59,10 +59,8 @@ using variable_benchmark_traits = VARIABLE_BENCHMARK_TRAITS;
 using variable_benchmark_traits = default_variable_benchmark_traits;
 #endif
 
-inline constexpr cuda::std::uint64_t seed = 0xCCC1;
-
 [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr cuda::std::uint64_t
-counter_u64(cuda::std::uint64_t index, cuda::std::uint64_t stream = 0) noexcept
+counter_u64(cuda::std::uint64_t index, cuda::std::uint64_t stream, cuda::std::uint64_t seed) noexcept
 {
   auto value = seed ^ (index * 0x9E3779B97F4A7C15ULL) ^ (stream * 0xD1B54A32D192ED03ULL);
   value += 0x9E3779B97F4A7C15ULL;
@@ -72,19 +70,20 @@ counter_u64(cuda::std::uint64_t index, cuda::std::uint64_t stream = 0) noexcept
 }
 
 [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr double
-counter_uniform(cuda::std::uint64_t index, cuda::std::uint64_t stream = 0) noexcept
+counter_uniform(cuda::std::uint64_t index, cuda::std::uint64_t stream, cuda::std::uint64_t seed) noexcept
 {
-  return static_cast<double>((counter_u64(index, stream) >> 11) + 0.5) / 9007199254740992.0;
+  return static_cast<double>((counter_u64(index, stream, seed) >> 11) + 0.5) / 9007199254740992.0;
 }
 
 struct lognormal_weight
 {
   double sigma;
+  cuda::std::uint64_t seed;
 
   [[nodiscard]] _CCCL_HOST_DEVICE_API double operator()(cuda::std::uint64_t index) const noexcept
   {
-    const auto first  = counter_uniform(index, 0);
-    const auto second = counter_uniform(index, 1);
+    const auto first  = counter_uniform(index, 0, seed);
+    const auto second = counter_uniform(index, 1, seed);
     const auto normal =
       cuda::std::sqrt(-2.0 * cuda::std::log(first)) * cuda::std::cos(6.283185307179586476925286766559 * second);
     return cuda::std::exp(sigma * normal);
@@ -94,10 +93,11 @@ struct lognormal_weight
 struct pareto_weight
 {
   double alpha;
+  cuda::std::uint64_t seed;
 
   [[nodiscard]] _CCCL_HOST_DEVICE_API double operator()(cuda::std::uint64_t index) const noexcept
   {
-    return cuda::std::pow(1.0 - counter_uniform(index, 2), -1.0 / alpha);
+    return cuda::std::pow(1.0 - counter_uniform(index, 2, seed), -1.0 / alpha);
   }
 };
 
@@ -114,10 +114,11 @@ struct zipf_mass
 struct zipf_sample
 {
   double total;
+  cuda::std::uint64_t seed;
 
   [[nodiscard]] _CCCL_HOST_DEVICE_API double operator()(cuda::std::uint64_t index) const noexcept
   {
-    return counter_uniform(index, 3) * total;
+    return counter_uniform(index, 3, seed) * total;
   }
 };
 
@@ -132,19 +133,21 @@ struct rank_to_weight
 
 struct multimodal_hash
 {
-  [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr cuda::std::uint64_t
-  operator()(cuda::std::uint64_t index) const noexcept
+  cuda::std::uint64_t seed;
+
+  [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr cuda::std::uint64_t operator()(cuda::std::uint64_t index) const noexcept
   {
-    return counter_u64(index, 4);
+    return counter_u64(index, 4, seed);
   }
 };
 
 struct shuffled_hash
 {
-  [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr cuda::std::uint64_t
-  operator()(cuda::std::uint64_t index) const noexcept
+  cuda::std::uint64_t seed;
+
+  [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr cuda::std::uint64_t operator()(cuda::std::uint64_t index) const noexcept
   {
-    return counter_u64(index, 5);
+    return counter_u64(index, 5, seed);
   }
 };
 
@@ -213,7 +216,7 @@ template <typename OffsetT, typename Weight>
 }
 
 template <typename OffsetT>
-[[nodiscard]] thrust::device_vector<double> generate_zipf_weights(OffsetT num_segments, double exponent)
+[[nodiscard]] thrust::device_vector<double> generate_zipf_weights(seed_t seed, OffsetT num_segments, double exponent)
 {
   auto cumulative = thrust::device_vector<double>(num_segments, thrust::no_init);
   thrust::tabulate(cumulative.begin(), cumulative.end(), zipf_mass{exponent});
@@ -221,7 +224,7 @@ template <typename OffsetT>
   const auto total = static_cast<double>(cumulative.back());
 
   auto samples = thrust::device_vector<double>(num_segments, thrust::no_init);
-  thrust::tabulate(samples.begin(), samples.end(), zipf_sample{total});
+  thrust::tabulate(samples.begin(), samples.end(), zipf_sample{total, seed.get()});
 
   auto ranks = thrust::device_vector<OffsetT>(num_segments, thrust::no_init);
   thrust::lower_bound(cumulative.begin(), cumulative.end(), samples.begin(), samples.end(), ranks.begin());
@@ -247,7 +250,7 @@ template <typename OffsetT>
 generate_multimodal_weights(OffsetT num_segments, OffsetT long_count, double weight_ratio)
 {
   auto hashes = thrust::device_vector<cuda::std::uint64_t>(num_segments, thrust::no_init);
-  thrust::tabulate(hashes.begin(), hashes.end(), multimodal_hash{});
+  thrust::tabulate(hashes.begin(), hashes.end(), multimodal_hash{seed_t{}.get()});
 
   auto indices = thrust::device_vector<OffsetT>(num_segments, thrust::no_init);
   thrust::sequence(indices.begin(), indices.end());
@@ -285,7 +288,7 @@ template <typename OffsetT>
   if (ordering == "shuffled")
   {
     auto hashes = thrust::device_vector<cuda::std::uint64_t>(lengths.size(), thrust::no_init);
-    thrust::tabulate(hashes.begin(), hashes.end(), shuffled_hash{});
+    thrust::tabulate(hashes.begin(), hashes.end(), shuffled_hash{seed_t{}.get()});
     thrust::stable_sort_by_key(hashes.begin(), hashes.end(), lengths.begin());
     return true;
   }
@@ -295,7 +298,7 @@ template <typename OffsetT>
     thrust::stable_sort(sorted_lengths.begin(), sorted_lengths.end(), ::cuda::std::greater<OffsetT>{});
 
     auto hashes = thrust::device_vector<cuda::std::uint64_t>(lengths.size(), thrust::no_init);
-    thrust::tabulate(hashes.begin(), hashes.end(), shuffled_hash{});
+    thrust::tabulate(hashes.begin(), hashes.end(), shuffled_hash{seed_t{}.get()});
     thrust::stable_sort_by_key(hashes.begin(), hashes.begin() + long_count, sorted_lengths.begin());
     thrust::stable_sort_by_key(
       hashes.begin() + long_count, hashes.end(), sorted_lengths.begin() + long_count);
@@ -559,7 +562,7 @@ void lognormal_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl
   const auto mean_segment_size = static_cast<OffsetT>(state.get_int64("MeanSegmentSize{io}"));
   const auto sigma             = state.get_float64("Sigma{io}");
   const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
-  const auto weights           = generate_weights(num_segments, lognormal_weight{sigma});
+  const auto weights           = generate_weights(num_segments, lognormal_weight{sigma, seed_t{}.get()});
   variable_segmented_scan(state, tl, weights, cuda::ceil_div(num_segments, OffsetT{4}));
 }
 
@@ -570,7 +573,7 @@ void pareto_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
   const auto mean_segment_size = static_cast<OffsetT>(state.get_int64("MeanSegmentSize{io}"));
   const auto alpha             = state.get_float64("Alpha{io}");
   const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
-  const auto weights           = generate_weights(num_segments, pareto_weight{alpha});
+  const auto weights           = generate_weights(num_segments, pareto_weight{alpha, seed_t{}.get()});
   variable_segmented_scan(state, tl, weights, cuda::ceil_div(num_segments, OffsetT{4}));
 }
 
@@ -581,7 +584,7 @@ void zipf_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> tl)
   const auto mean_segment_size = static_cast<OffsetT>(state.get_int64("MeanSegmentSize{io}"));
   const auto exponent          = state.get_float64("Exponent{io}");
   const auto num_segments      = cuda::ceil_div(elements, mean_segment_size);
-  const auto weights           = generate_zipf_weights(num_segments, exponent);
+  const auto weights           = generate_zipf_weights(seed_t{}, num_segments, exponent);
   variable_segmented_scan(state, tl, weights, cuda::ceil_div(num_segments, OffsetT{4}));
 }
 
@@ -615,39 +618,53 @@ void multimodal_segments(nvbench::state& state, nvbench::type_list<T, OffsetT> t
 using variable_value_types  = variable_benchmark_traits::value_types;
 using variable_offset_types = nvbench::type_list<int32_t>;
 
+// The range runs from uniform through increasingly concentrated segment-length distributions and stops before a
+// single segment owns most of the array, at which point the kernel has nothing left to balance.
 NVBENCH_BENCH_TYPES(lognormal_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
   .set_name("ragged_lognormal")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis(
-    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
-  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "shuffled", "clustered"})
-  .add_float64_axis("Sigma{io}", {0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5});
+  .add_int64_power_of_two_axis("Elements{io}", {22, 26})
+  .add_int64_axis("MeanSegmentSize{io}", {32, 64, 128, 256, 512, 1024, 2048})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled"})
+  .add_float64_axis(
+    "Sigma{io}",
+    {0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+     0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5, 1.55, 1.6, 1.65, 1.7,
+     1.75, 1.8, 1.85, 1.9, 1.95, 2.0,
+     2.1, 2.2, 2.3, 2.4, 2.5});
 
 NVBENCH_BENCH_TYPES(pareto_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
   .set_name("ragged_pareto")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis(
-    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
-  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "shuffled", "clustered"})
-  .add_float64_axis("Alpha{io}", {5.0, 4.0, 3.0, 2.5, 2.0, 1.75, 1.5});
+  .add_int64_power_of_two_axis("Elements{io}", {22, 26})
+  .add_int64_axis("MeanSegmentSize{io}", {32, 64, 128, 256, 512, 1024, 2048})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled"})
+  .add_float64_axis(
+    "Alpha{io}",
+    {1.3, 1.4,
+     1.5, 1.55, 1.6, 1.65, 1.7, 1.75, 1.8, 1.85, 1.9, 1.95, 2.0, 2.05, 2.1, 2.15, 2.2, 2.25, 2.3, 2.35, 2.4,
+     2.45, 2.5,
+     2.6, 2.7, 2.8, 2.9, 3.0,
+     3.2, 3.4, 3.6, 3.8, 4.0, 4.2, 4.4, 4.6, 4.8, 5.0});
 
 NVBENCH_BENCH_TYPES(zipf_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
   .set_name("ragged_zipf")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis(
-    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
-  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "shuffled", "clustered"})
-  .add_float64_axis("Exponent{io}", {0.75, 1.0, 1.25, 1.5, 1.6, 2.0});
+  .add_int64_power_of_two_axis("Elements{io}", {22, 26})
+  .add_int64_axis("MeanSegmentSize{io}", {32, 64, 128, 256, 512, 1024, 2048})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled"})
+  .add_float64_axis(
+    "Exponent{io}",
+    {0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7,
+     0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5, 1.55, 1.6, 1.65,
+     1.7, 1.75, 1.8, 1.85, 1.9, 1.95, 2.0,
+     2.2, 2.5, 3.0});
 
 NVBENCH_BENCH_TYPES(multimodal_segments, NVBENCH_TYPE_AXES(variable_value_types, variable_offset_types))
   .set_name("ragged_multimodal")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(18, 26, 4))
-  .add_int64_axis(
-    "MeanSegmentSize{io}", {32, 51, 64, 123, 128, 233, 256, 512, 513, 1024, 1337, 2048, 4096, 8192, 16384})
-  .add_string_axis("SegmentOrdering{io}", {"as_sampled", "ascending", "descending", "shuffled", "clustered"})
-  .add_float64_axis("LongSegmentFraction{io}", {0.25, 0.10, 0.02})
-  .add_float64_axis("LongToShortRatio{io}", {10.0, 50.0, 100.0});
+  .add_int64_power_of_two_axis("Elements{io}", {22, 26})
+  .add_int64_axis("MeanSegmentSize{io}", {32, 64, 128, 256, 512, 1024, 2048})
+  .add_string_axis("SegmentOrdering{io}", {"as_sampled"})
+  .add_float64_axis("LongSegmentFraction{io}", {0.02, 0.05, 0.10, 0.20})
+  .add_float64_axis("LongToShortRatio{io}", {2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 100.0, 200.0});

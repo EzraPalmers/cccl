@@ -34,12 +34,12 @@ NVBENCH_BENCH(zipf_sampled)
   .set_name("zipf_sampled")
   .add_int64_power_of_two_axis("Elements{io}", {22, 26})
   .add_int64_axis("MeanSegmentSize{io}", {256, 512, 2048})
-  .add_float64_axis("Exponent{io}", {0.0, 0.8, 1.0, 1.2})
+  .add_float64_axis("Exponent{io}", {0.0, 0.75, 1.5, 2.2, 3.0})
   .add_int64_axis("Seed{io}", {1, 2, 3, 4, 5, 6, 7, 8, 9, 42});
 
 NVBENCH_BENCH(zipf_quantile)
   .set_name("zipf_quantile")
   .add_int64_power_of_two_axis("Elements{io}", {22, 26})
   .add_int64_axis("MeanSegmentSize{io}", {256, 512, 2048})
-  .add_float64_axis("Exponent{io}", {0.0, 0.8, 1.0, 1.2})
+  .add_float64_axis("Exponent{io}", {0.0, 0.75, 1.5, 2.2, 3.0})
   .add_int64_axis("Seed{io}", {1, 2, 3, 4, 5, 6, 7, 8, 9, 42});

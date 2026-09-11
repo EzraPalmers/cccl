@@ -34,12 +34,12 @@ NVBENCH_BENCH(pareto_sampled)
   .set_name("pareto_sampled")
   .add_int64_power_of_two_axis("Elements{io}", {22, 26})
   .add_int64_axis("MeanSegmentSize{io}", {256, 512, 2048})
-  .add_float64_axis("Alpha{io}", {100.0, 2.1, 1.5, 1.25})
+  .add_float64_axis("Alpha{io}", {1.3, 2.0, 3.0, 4.0, 5.0})
   .add_int64_axis("Seed{io}", {1, 2, 3, 4, 5, 6, 7, 8, 9, 42});
 
 NVBENCH_BENCH(pareto_quantile)
   .set_name("pareto_quantile")
   .add_int64_power_of_two_axis("Elements{io}", {22, 26})
   .add_int64_axis("MeanSegmentSize{io}", {256, 512, 2048})
-  .add_float64_axis("Alpha{io}", {100.0, 2.1, 1.5, 1.25})
+  .add_float64_axis("Alpha{io}", {1.3, 2.0, 3.0, 4.0, 5.0})
   .add_int64_axis("Seed{io}", {1, 2, 3, 4, 5, 6, 7, 8, 9, 42});

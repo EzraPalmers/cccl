@@ -122,29 +122,6 @@ struct rank_to_weight
   }
 };
 
-struct multimodal_weight
-{
-  distribution_probability probability;
-  double long_fraction;
-  double long_to_short_ratio;
-
-  [[nodiscard]] _CCCL_HOST_DEVICE_API double operator()(::cuda::std::uint64_t index) const noexcept
-  {
-    return probability(index) < long_fraction ? long_to_short_ratio : 1.0;
-  }
-};
-
-struct deterministic_multimodal_weight
-{
-  offset_type long_count;
-  double long_to_short_ratio;
-
-  [[nodiscard]] _CCCL_HOST_DEVICE_API double operator()(offset_type index) const noexcept
-  {
-    return index < long_count ? long_to_short_ratio : 1.0;
-  }
-};
-
 template <typename Weight>
 [[nodiscard]] thrust::device_vector<double> make_weights(offset_type count, Weight weight)
 {
@@ -153,32 +130,36 @@ template <typename Weight>
   return weights;
 }
 
-[[nodiscard]] inline thrust::device_vector<double>
-make_lognormal_weights(offset_type count, double sigma, seed_type seed, generation_mode mode)
+// Keys the shuffle by ShuffleSeed and streams it by GenerationSeed (0 in quantile mode, which has
+// no GenerationSeed axis), so no (GenerationSeed, ShuffleSeed) pair collides with another.
+inline void shuffle_weights(thrust::device_vector<double>& weights, seed_type shuffle_seed, seed_type generation_seed)
 {
-  auto weights = make_weights(count, lognormal_weight{mode, seed, static_cast<::cuda::std::uint64_t>(count), sigma});
-  if (mode == generation_mode::quantile)
-  {
-    thrust::shuffle(weights.begin(), weights.end(), ::cuda::std::philox4x32{seed});
-  }
+  ::cuda::std::philox4x32 rng(shuffle_seed);
+  rng.set_counter({0, 0, generation_seed, 0});
+  thrust::shuffle(weights.begin(), weights.end(), rng);
+}
+
+[[nodiscard]] inline thrust::device_vector<double> make_lognormal_weights(
+  offset_type count, double sigma, seed_type generation_seed, seed_type shuffle_seed, generation_mode mode)
+{
+  auto weights =
+    make_weights(count, lognormal_weight{mode, generation_seed, static_cast<::cuda::std::uint64_t>(count), sigma});
+  shuffle_weights(weights, shuffle_seed, generation_seed);
   return weights;
 }
 
-[[nodiscard]] inline thrust::device_vector<double>
-make_pareto_weights(offset_type count, double alpha, seed_type seed, generation_mode mode)
+[[nodiscard]] inline thrust::device_vector<double> make_pareto_weights(
+  offset_type count, double alpha, seed_type generation_seed, seed_type shuffle_seed, generation_mode mode)
 {
   auto weights = make_weights(
     count,
-    pareto_weight{{mode, seed, static_cast<::cuda::std::uint64_t>(count)}, alpha});
-  if (mode == generation_mode::quantile)
-  {
-    thrust::shuffle(weights.begin(), weights.end(), ::cuda::std::philox4x32{seed});
-  }
+    pareto_weight{{mode, generation_seed, static_cast<::cuda::std::uint64_t>(count)}, alpha});
+  shuffle_weights(weights, shuffle_seed, generation_seed);
   return weights;
 }
 
-[[nodiscard]] inline thrust::device_vector<double>
-make_zipf_weights(offset_type count, double exponent, seed_type seed, generation_mode mode)
+[[nodiscard]] inline thrust::device_vector<double> make_zipf_weights(
+  offset_type count, double exponent, seed_type generation_seed, seed_type shuffle_seed, generation_mode mode)
 {
   auto cumulative = make_weights(count, zipf_mass{exponent});
   thrust::inclusive_scan(cumulative.begin(), cumulative.end(), cumulative.begin());
@@ -186,38 +167,13 @@ make_zipf_weights(offset_type count, double exponent, seed_type seed, generation
 
   auto samples = make_weights(
     count,
-    probability_scale{{mode, seed, static_cast<::cuda::std::uint64_t>(count)}, total});
+    probability_scale{{mode, generation_seed, static_cast<::cuda::std::uint64_t>(count)}, total});
   auto ranks = thrust::device_vector<offset_type>(count, thrust::no_init);
   thrust::lower_bound(cumulative.begin(), cumulative.end(), samples.begin(), samples.end(), ranks.begin());
 
   auto weights = thrust::device_vector<double>(count, thrust::no_init);
   thrust::transform(ranks.begin(), ranks.end(), weights.begin(), rank_to_weight{});
-  if (mode == generation_mode::quantile)
-  {
-    thrust::shuffle(weights.begin(), weights.end(), ::cuda::std::philox4x32{seed});
-  }
-  return weights;
-}
-
-[[nodiscard]] inline thrust::device_vector<double> make_multimodal_weights(
-  offset_type count,
-  double long_fraction,
-  double long_to_short_ratio,
-  seed_type seed,
-  generation_mode mode)
-{
-  if (mode == generation_mode::sampled)
-  {
-    return make_weights(
-      count,
-      multimodal_weight{{mode, seed, static_cast<::cuda::std::uint64_t>(count)},
-                        long_fraction,
-                        long_to_short_ratio});
-  }
-
-  const auto long_count = static_cast<offset_type>(::cuda::std::round(long_fraction * static_cast<double>(count)));
-  auto weights = make_weights(count, deterministic_multimodal_weight{long_count, long_to_short_ratio});
-  thrust::shuffle(weights.begin(), weights.end(), ::cuda::std::philox4x32{seed});
+  shuffle_weights(weights, shuffle_seed, generation_seed);
   return weights;
 }
 
@@ -331,17 +287,22 @@ inline void run(nvbench::state& state, const thrust::device_vector<double>& weig
   return ::cuda::ceil_div(elements, mean);
 }
 
-[[nodiscard]] inline seed_type study_seed(nvbench::state& state)
+[[nodiscard]] inline seed_type study_generation_seed(nvbench::state& state)
 {
-  return static_cast<seed_type>(state.get_int64("Seed{io}"));
+  return static_cast<seed_type>(state.get_int64("GenerationSeed{io}"));
+}
+
+[[nodiscard]] inline seed_type study_shuffle_seed(nvbench::state& state)
+{
+  return static_cast<seed_type>(state.get_int64("ShuffleSeed{io}"));
 }
 
 [[nodiscard]] inline bool is_study_cell(nvbench::state& state)
 {
   const auto elements = state.get_int64("Elements{io}");
   const auto mean     = state.get_int64("MeanSegmentSize{io}");
-  if ((elements == (1LL << 22) && (mean == 256 || mean == 512))
-      || (elements == (1LL << 26) && (mean == 512 || mean == 2048)))
+  if ((elements == (1LL << 22) && (mean == 128 || mean == 256 || mean == 512))
+      || (elements == (1LL << 26) && (mean == 256 || mean == 512 || mean == 2048)))
   {
     return true;
   }

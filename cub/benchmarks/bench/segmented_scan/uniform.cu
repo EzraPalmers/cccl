@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "segments_base.cuh"
+#include "variable_base.cuh"
 
 namespace
 {
@@ -10,8 +10,8 @@ namespace
 template <typename T, typename OffsetT>
 void uniform(nvbench::state& state, nvbench::type_list<T, OffsetT>)
 {
-  const auto count    = segmented_scan_study::segment_count(state);
-  const auto weights  = thrust::device_vector<double>(count, 1.0);
+  const auto count   = segmented_scan_study::segment_count(state);
+  const auto weights = thrust::device_vector<double>(count, 1.0);
   segmented_scan_study::run<T>(state, weights);
 }
 } // namespace

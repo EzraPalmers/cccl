@@ -28,8 +28,12 @@
 namespace segmented_scan_study
 {
 using offset_type = ::cuda::std::int32_t;
-using value_type  = ::cuda::std::int32_t;
-using seed_type   = ::cuda::std::philox4x32::result_type;
+using seed_type    = ::cuda::std::philox4x32::result_type;
+
+// This branch sweeps distributions and mean segment sizes at one seed each; seed variation
+// belongs to the seed-stability branch.
+inline constexpr seed_type fixed_generation_seed{0};
+inline constexpr seed_type fixed_shuffle_seed{0};
 
 enum class generation_mode
 {
@@ -122,6 +126,33 @@ struct rank_to_weight
   }
 };
 
+// Sampled mode compares a per-index draw against LongSegmentFraction; quantile mode compares the
+// deterministic quantile position instead, so both share this one functor.
+struct multimodal_weight
+{
+  distribution_probability probability;
+  double long_fraction;
+  double long_to_short_ratio;
+
+  [[nodiscard]] _CCCL_HOST_DEVICE_API double operator()(::cuda::std::uint64_t index) const noexcept
+  {
+    return probability(index) < long_fraction ? long_to_short_ratio : 1.0;
+  }
+};
+
+// Quantile mode uses this rank threshold directly rather than routing through
+// distribution_probability's quantile branch, avoiding a division per index.
+struct deterministic_multimodal_weight
+{
+  offset_type long_count;
+  double long_to_short_ratio;
+
+  [[nodiscard]] _CCCL_HOST_DEVICE_API double operator()(offset_type index) const noexcept
+  {
+    return index < long_count ? long_to_short_ratio : 1.0;
+  }
+};
+
 template <typename Weight>
 [[nodiscard]] thrust::device_vector<double> make_weights(offset_type count, Weight weight)
 {
@@ -130,8 +161,9 @@ template <typename Weight>
   return weights;
 }
 
-// Keys the shuffle by ShuffleSeed and streams it by GenerationSeed (0 in quantile mode, which has
-// no GenerationSeed axis), so no (GenerationSeed, ShuffleSeed) pair collides with another.
+// Keys the shuffle by ShuffleSeed and streams it by GenerationSeed, so no (GenerationSeed,
+// ShuffleSeed) pair collides with another. Both are fixed constants on this branch, but the
+// helper stays generation-seed-aware for parity with the seed-stability branch it was shared from.
 inline void shuffle_weights(thrust::device_vector<double>& weights, seed_type shuffle_seed, seed_type generation_seed)
 {
   ::cuda::std::philox4x32 rng(shuffle_seed);
@@ -173,6 +205,37 @@ inline void shuffle_weights(thrust::device_vector<double>& weights, seed_type sh
 
   auto weights = thrust::device_vector<double>(count, thrust::no_init);
   thrust::transform(ranks.begin(), ranks.end(), weights.begin(), rank_to_weight{});
+  shuffle_weights(weights, shuffle_seed, generation_seed);
+  return weights;
+}
+
+// No correction is applied for the fixed weight ratio overshooting the requested
+// LongSegmentFraction/LongToShortRatio at small mean segment sizes; the realised long-to-short
+// ratio drifts from the requested one there. testing's compensated_multimodal_weight_ratio is not
+// ported.
+[[nodiscard]] inline thrust::device_vector<double> make_multimodal_weights(
+  offset_type count,
+  double long_fraction,
+  double long_to_short_ratio,
+  seed_type generation_seed,
+  seed_type shuffle_seed,
+  generation_mode mode)
+{
+  thrust::device_vector<double> weights;
+  if (mode == generation_mode::sampled)
+  {
+    weights = make_weights(
+      count,
+      multimodal_weight{{mode, generation_seed, static_cast<::cuda::std::uint64_t>(count)},
+                        long_fraction,
+                        long_to_short_ratio});
+  }
+  else
+  {
+    const auto long_count =
+      static_cast<offset_type>(::cuda::std::round(long_fraction * static_cast<double>(count)));
+    weights = make_weights(count, deterministic_multimodal_weight{long_count, long_to_short_ratio});
+  }
   shuffle_weights(weights, shuffle_seed, generation_seed);
   return weights;
 }
@@ -235,6 +298,7 @@ struct cumulative_to_offset
   return offsets;
 }
 
+template <typename T>
 inline void run(nvbench::state& state, const thrust::device_vector<double>& weights)
 {
   const auto elements          = static_cast<offset_type>(state.get_int64("Elements{io}"));
@@ -245,22 +309,22 @@ inline void run(nvbench::state& state, const thrust::device_vector<double>& weig
   summary.set_string("name", "#Segments");
   summary.set_int64("value", count);
 
-  const thrust::device_vector<value_type> input = generate(elements);
-  thrust::device_vector<value_type> output(elements, thrust::default_init);
+  const thrust::device_vector<T> input = generate(elements);
+  thrust::device_vector<T> output(elements, thrust::default_init);
   const auto offsets = weights_to_offsets(state, elements, count, weights);
   if (offsets.empty())
   {
     return;
   }
 
-  const value_type* d_input  = thrust::raw_pointer_cast(input.data());
-  value_type* d_output       = thrust::raw_pointer_cast(output.data());
-  const offset_type* d_begin = thrust::raw_pointer_cast(offsets.data());
+  const T* d_input            = thrust::raw_pointer_cast(input.data());
+  T* d_output                 = thrust::raw_pointer_cast(output.data());
+  const offset_type* d_begin  = thrust::raw_pointer_cast(offsets.data());
 
   state.add_element_count(elements, "Elements");
-  state.add_global_memory_reads<value_type>(elements);
+  state.add_global_memory_reads<T>(elements);
   state.add_global_memory_reads<offset_type>(count + 1);
-  state.add_global_memory_writes<value_type>(elements);
+  state.add_global_memory_writes<T>(elements);
 
   caching_allocator_t alloc;
   state.exec(nvbench::exec_tag::gpu | nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
@@ -275,7 +339,7 @@ inline void run(nvbench::state& state, const thrust::device_vector<double>& weig
       d_begin,
       count,
       ::cuda::std::plus<>{},
-      value_type{},
+      T{},
       env);
   });
 }
@@ -287,26 +351,6 @@ inline void run(nvbench::state& state, const thrust::device_vector<double>& weig
   return ::cuda::ceil_div(elements, mean);
 }
 
-[[nodiscard]] inline seed_type study_generation_seed(nvbench::state& state)
-{
-  return static_cast<seed_type>(state.get_int64("GenerationSeed{io}"));
-}
-
-[[nodiscard]] inline seed_type study_shuffle_seed(nvbench::state& state)
-{
-  return static_cast<seed_type>(state.get_int64("ShuffleSeed{io}"));
-}
-
-[[nodiscard]] inline bool is_study_cell(nvbench::state& state)
-{
-  const auto elements = state.get_int64("Elements{io}");
-  const auto mean     = state.get_int64("MeanSegmentSize{io}");
-  if ((elements == (1LL << 22) && (mean == 128 || mean == 256 || mean == 512))
-      || (elements == (1LL << 26) && (mean == 256 || mean == 512 || mean == 2048)))
-  {
-    return true;
-  }
-  state.skip("element count and mean segment size are not a study cell");
-  return false;
-}
+using value_types  = nvbench::type_list<::cuda::std::int32_t, ::cuda::std::int64_t, float, double>;
+using offset_types = nvbench::type_list<::cuda::std::int32_t>;
 } // namespace segmented_scan_study

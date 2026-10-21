@@ -161,12 +161,18 @@ struct policy_selector
     const auto block_scaled =
       scale_mem_bound(nominal_threads_per_block, nominal_items_per_thread, augmented_size_block);
 
+    const bool large_values = augmented_size_block > 128;
+    const auto scan_transposed_blockload =
+      large_values ? BLOCK_LOAD_WARP_TRANSPOSE_TIMESLICED : BLOCK_LOAD_WARP_TRANSPOSE;
+    const auto scan_transposed_blockstore =
+      large_values ? BLOCK_STORE_WARP_TRANSPOSE_TIMESLICED : BLOCK_STORE_WARP_TRANSPOSE;
+
     return SegmentedScanPolicy{SegmentedScanBlockPolicy{
       block_scaled.threads_per_block,
       block_scaled.items_per_thread,
-      BLOCK_LOAD_DIRECT,
+      scan_transposed_blockload,
       LOAD_DEFAULT,
-      BLOCK_STORE_DIRECT,
+      scan_transposed_blockstore,
       BLOCK_SCAN_WARP_SCANS,
       max_segments_per_block}};
   }
@@ -189,14 +195,15 @@ struct load_balanced_policy_selector
 
     _CCCL_ASSERT(pair_size > 0, "Pair size must be positive");
 
-    const auto scaled = scale_mem_bound(nominal_threads_per_block, nominal_items_per_thread, pair_size);
+    const auto scaled       = scale_mem_bound(nominal_threads_per_block, nominal_items_per_thread, pair_size);
+    const bool large_values = pair_size > 128;
 
     return SegmentedScanLoadBalancedPolicy{
       scaled.threads_per_block,
       scaled.items_per_thread,
-      BLOCK_LOAD_DIRECT,
+      large_values ? BLOCK_LOAD_WARP_TRANSPOSE_TIMESLICED : BLOCK_LOAD_WARP_TRANSPOSE,
       LOAD_DEFAULT,
-      BLOCK_STORE_DIRECT,
+      large_values ? BLOCK_STORE_WARP_TRANSPOSE_TIMESLICED : BLOCK_STORE_WARP_TRANSPOSE,
       BLOCK_SCAN_WARP_SCANS};
   }
 };
